@@ -2,8 +2,10 @@ package apps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"time"
 
@@ -27,6 +29,37 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
+
+type ReaderNodeSyncState struct {
+	BlockNum uint64 `json:"last_seen_block_num"`
+}
+
+func writeNodeSyncState(state *ReaderNodeSyncState, path string) (err error) {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal json: %w", err)
+	}
+
+	return os.WriteFile(path, data, os.ModePerm)
+}
+
+func readNodeSyncState(path string) (state *ReaderNodeSyncState, err error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+
+	if len(content) == 0 {
+		return &ReaderNodeSyncState{BlockNum: 0}, nil
+	}
+
+	if err := json.Unmarshal(content, &state); err != nil {
+		return nil, fmt.Errorf("unmarshal file %q: %w", path, err)
+	}
+
+	return state, nil
+}
+
 
 func RegisterReaderNodeApp[B firecore.Block](chain *firecore.Chain[B], rootLog *zap.Logger) {
 	appLogger, appTracer := logging.PackageLogger("reader-node", "reader-node")
@@ -99,8 +132,21 @@ func RegisterReaderNodeApp[B firecore.Block](chain *firecore.Chain[B], rootLog *
 			defer cancel()
 
 			userDefined := viper.IsSet("reader-node-start-block-num")
-			startBlockNum := viper.GetUint64("reader-node-start-block-num")
+			
 			firstStreamableBlock := viper.GetUint64("common-first-streamable-block")
+
+			// Read the startBlockNum from the sync state file if it exists otherwise favor the reader-node-start-block-num arg
+			workingDir := firecore.MustReplaceDataDir(sfDataDir, viper.GetString("reader-node-working-dir"))
+			syncStateFile := filepath.Join(workingDir, "sync_state.json")
+			var startBlockNum uint64
+
+			syncState, err := readNodeSyncState(syncStateFile)
+			if err != nil {
+				startBlockNum = viper.GetUint64("reader-node-start-block-num")
+			} else {
+				startBlockNum = syncState.BlockNum
+			}
+
 
 			resolveStartBlockNum := startBlockNum
 			if !userDefined {
@@ -172,7 +218,6 @@ func RegisterReaderNodeApp[B firecore.Block](chain *firecore.Chain[B], rootLog *
 
 			blockStreamServer := blockstream.NewUnmanagedServer(blockstream.ServerOptionWithLogger(appLogger))
 			oneBlocksStoreURL := firecore.MustReplaceDataDir(sfDataDir, viper.GetString("common-one-block-store-url"))
-			workingDir := firecore.MustReplaceDataDir(sfDataDir, viper.GetString("reader-node-working-dir"))
 			gprcListenAddr := viper.GetString("reader-node-grpc-listen-addr")
 			oneBlockFileSuffix := viper.GetString("reader-node-one-block-suffix")
 			blocksChanCapacity := viper.GetInt("reader-node-blocks-chan-capacity")
@@ -200,6 +245,15 @@ func RegisterReaderNodeApp[B firecore.Block](chain *firecore.Chain[B], rootLog *
 			}
 
 			superviser.RegisterLogPlugin(readerPlugin)
+
+			// add a hook that will store the latest block updated
+			readerPlugin.OnBlockWritten(func(block *pbbstream.Block) error {
+				if err := writeNodeSyncState(&ReaderNodeSyncState{BlockNum: block.GetFirehoseBlockNumber()}, syncStateFile); err != nil {
+					return fmt.Errorf("write node sync state: %w", err)
+				}
+
+				return nil
+			})
 
 			return nodeManagerApp.New(&nodeManagerApp.Config{
 				HTTPAddr: httpAddr,
